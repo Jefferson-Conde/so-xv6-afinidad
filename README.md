@@ -30,14 +30,24 @@ El informe completo, la presentación y las evidencias están en la carpeta [`do
 
 ## Requisitos
 
-- Ubuntu (se desarrolló en Ubuntu sobre WSL2 con Windows).
-- Paquetes: `git`, `build-essential`, `gdb-multiarch`, `qemu-system-misc`, `gcc-riscv64-linux-gnu`, `binutils-riscv64-linux-gnu`.
+Se necesita QEMU 7.2 o superior, herramientas cruzadas RISC-V, GCC del anfitrión, GNU Make, Perl y `bc`.
+
+### Ubuntu y Debian
 
 ```bash
 sudo apt update
-sudo apt install git build-essential gdb-multiarch qemu-system-misc \
+sudo apt install git build-essential bc perl qemu-system-misc \
     gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu
 ```
+
+### Arch Linux y Artix Linux (x86_64)
+
+```bash
+sudo pacman -Syu --needed base-devel git bc perl qemu-system-riscv \
+    riscv64-linux-gnu-gcc riscv64-linux-gnu-binutils
+```
+
+Consulta las versiones instaladas con `qemu-system-riscv64 --version` y `riscv64-linux-gnu-gcc --version`.
 
 ## Instalación
 
@@ -55,7 +65,7 @@ git diff base-xv6 main --stat
 ## Compilación y ejecución
 
 ```bash
-make qemu CPUS=4
+make qemu CPUS=4 TOOLPREFIX=riscv64-linux-gnu-
 ```
 
 Esto compila el kernel y los programas de usuario, y arranca xv6 en QEMU con cuatro CPUs. Deben aparecer tres mensajes
