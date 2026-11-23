@@ -7,10 +7,10 @@ Tema: *Afinidad de CPU y estadísticas por núcleo sobre un planificador con pri
 
 | Elemento | Archivo o carpeta |
 |---|---|
-| Trabajo monográfico completo (formato APA 7) | `Informe_xv6_afinidad_APA7.docx` y `Informe_xv6_afinidad_APA7.pdf` |
-| Presentación en PowerPoint | `Presentacion_xv6_afinidad.pptx` |
-| Evidencias (capturas de compilación, ejecución, pruebas y errores corregidos) | `evidencias/` |
-| Documentación complementaria | `documentacion_complementaria/` |
+| Trabajo monográfico (APA 7) | [Informe en Word](Informe_xv6_afinidad_APA7.docx) · [Informe en PDF](Informe_xv6_afinidad_APA7.pdf) |
+| Presentación en PowerPoint | [Presentacion_xv6_afinidad.pptx](Presentacion_xv6_afinidad.pptx) |
+| Capturas de compilación, ejecución y pruebas | [evidencias/](evidencias/) |
+| Guía de reproducción, parches y publicación | [documentacion_complementaria/](documentacion_complementaria/) |
 
 `documentacion_complementaria/` contiene:
 

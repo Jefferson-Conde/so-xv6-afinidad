@@ -26,7 +26,7 @@ Este proyecto lo extiende, sobre el commit base `9e3161a`, con:
   retención y espera entre CPUs (una de las cuatro condiciones de deadlock de Coffman et al., 1971).
 - **Cinco llamadas al sistema, tres herramientas de usuario y una batería de ocho pruebas automáticas (`schedtest`).**
 
-El informe completo, la presentación y las evidencias están en la carpeta [`documento_TrabajoFinal`](documento_TrabajoFinal/).
+El informe, la presentación, las evidencias y el material de reproducción están en [`documento_TrabajoFinal`](documento_TrabajoFinal/).
 
 ## Requisitos
 
