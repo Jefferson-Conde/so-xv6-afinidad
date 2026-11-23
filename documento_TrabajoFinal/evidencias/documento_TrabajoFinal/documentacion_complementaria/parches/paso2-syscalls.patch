@@ -1,0 +1,148 @@
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1800f20..d7cf3c2 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -103,6 +103,11 @@ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+ extern uint64 sys_sync(void);
++extern uint64 sys_setpriority(void);
++extern uint64 sys_setaffinity(void);
++extern uint64 sys_getptable(void);
++extern uint64 sys_getcpu(void);
++extern uint64 sys_setaging(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -130,6 +135,11 @@ static uint64 (*syscalls[])(void) = {
+   [SYS_mkdir]   = sys_mkdir,
+   [SYS_close]   = sys_close,
+   [SYS_sync]    = sys_sync,
++  [SYS_setpriority] = sys_setpriority,
++  [SYS_setaffinity] = sys_setaffinity,
++  [SYS_getptable]   = sys_getptable,
++  [SYS_getcpu]      = sys_getcpu,
++  [SYS_setaging]    = sys_setaging,
+   // clang-format on
+ };
+ 
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 5a4a39f..dc33ced 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -21,3 +21,8 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_sync   22
++#define SYS_setpriority 23
++#define SYS_setaffinity 24
++#define SYS_getptable   25
++#define SYS_getcpu      26
++#define SYS_setaging    27
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index cd25557..addff8a 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -110,3 +110,65 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++// ---- Extensión del planificador: prioridad, afinidad de CPU y estadísticas ----
++
++// setpriority(pid, prio): fija la prioridad base (0..MAXPRIO). pid 0 = yo.
++uint64
++sys_setpriority(void)
++{
++  int pid, prio;
++
++  argint(0, &pid);
++  argint(1, &prio);
++  return kpriority(pid, prio);
++}
++
++// setaffinity(pid, mask): fija la máscara de CPUs permitidos. pid 0 = yo.
++uint64
++sys_setaffinity(void)
++{
++  int pid, mask;
++
++  argint(0, &pid);
++  argint(1, &mask);
++  return kaffinity(pid, (uint)mask);
++}
++
++// getptable(arr, max): copia la información de planificación de los procesos
++// en uso. Devuelve cuántos copió.
++uint64
++sys_getptable(void)
++{
++  uint64 addr;
++  int max;
++
++  argaddr(0, &addr);
++  argint(1, &max);
++  if (max < 0)
++    return -1;
++  return kgetptable(addr, max);
++}
++
++// getcpu(): número del CPU donde se está ejecutando el proceso (como sched_getcpu).
++uint64
++sys_getcpu(void)
++{
++  int id;
++
++  push_off(); // sin interrupciones, el proceso no puede cambiar de CPU a mitad
++  id = cpuid();
++  pop_off();
++  return id;
++}
++
++// setaging(on): activa (1) o desactiva (0) el aging del planificador.
++uint64
++sys_setaging(void)
++{
++  int on;
++
++  argint(0, &on);
++  set_aging(on);
++  return 0;
++}
+diff --git a/user/user.h b/user/user.h
+index 29aad59..35b5ab4 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,6 +1,7 @@
+ #define SBRK_ERROR ((char *)-1)
+ 
+ struct stat;
++struct pstat;
+ 
+ // system calls
+ int fork(void);
+@@ -25,6 +26,11 @@ char *sys_sbrk(int, int);
+ int pause(int);
+ int uptime(void);
+ int sync(void);
++int setpriority(int, int);
++int setaffinity(int, uint);
++int getptable(struct pstat *, int);
++int getcpu(void);
++int setaging(int);
+ 
+ // ulib.c
+ int stat(const char *, struct stat *);
+diff --git a/user/usys.pl b/user/usys.pl
+index 4d054e8..a7f7730 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -43,3 +43,8 @@ entry("sbrk");
+ entry("pause");
+ entry("uptime");
+ entry("sync");
++entry("setpriority");
++entry("setaffinity");
++entry("getptable");
++entry("getcpu");
++entry("setaging");

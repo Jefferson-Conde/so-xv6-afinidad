@@ -153,6 +153,7 @@ UPROGS=\
 	$U/_taskset\
 	$U/_cpustat\
 	$U/_hog\
+	$U/_schedtest\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

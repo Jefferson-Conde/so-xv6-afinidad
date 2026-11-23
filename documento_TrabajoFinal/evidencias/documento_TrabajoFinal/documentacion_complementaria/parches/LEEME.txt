@@ -1,0 +1,21 @@
+PROYECTO SO - xv6: planificador multinucleo con prioridad, aging y afinidad de CPU
+===================================================================================
+Base: xv6-riscv commit 9e3161a (https://github.com/mit-pdos/xv6-riscv)
+
+Los parches se aplican EN ORDEN sobre un xv6 limpio. Cada paso compila por si solo.
+
+  paso1-planificador.patch   kernel: struct proc, scheduler() en dos pasadas (sin deadlock),
+                             aging, afinidad, estadisticas por CPU
+  paso2-syscalls.patch       setpriority, setaffinity, getptable, getcpu, setaging
+  paso3-herramientas.patch   programas taskset, cpustat, hog
+  paso4-pruebas.patch        schedtest (8 pruebas con entrada/esperado/obtenido)
+  todo-junto.patch           los cuatro pasos en un solo parche
+
+Uso:
+  cd ~ && git clone https://github.com/mit-pdos/xv6-riscv.git xv6-proyecto
+  cd xv6-proyecto && git checkout 9e3161a && git checkout -b proyecto-final
+  git apply ~/entrega/paso1-planificador.patch      # y asi con cada paso
+  make qemu CPUS=4
+
+Cada integrante aplica y COMMITEA con su propia cuenta el paso que le toca, despues de
+leerlo y entenderlo (el parche es texto: se lee con "less paso1-planificador.patch").

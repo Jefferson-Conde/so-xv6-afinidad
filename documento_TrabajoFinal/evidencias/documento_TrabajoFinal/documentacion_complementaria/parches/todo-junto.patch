@@ -1,0 +1,1332 @@
+diff --git a/Makefile b/Makefile
+index af1e7a5..ef64717 100644
+--- a/Makefile
++++ b/Makefile
+@@ -150,6 +150,10 @@ UPROGS=\
+ 	$U/_forphan\
+ 	$U/_dorphan\
+ 	$U/_sync\
++	$U/_taskset\
++	$U/_cpustat\
++	$U/_hog\
++	$U/_schedtest\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 0ae6896..20699ee 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -103,6 +103,13 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++void            aging_tick(void);
++void            account_tick(void);
++int             kpriority(int, int);
++int             kaffinity(int, uint);
++int             kgetptable(uint64, int);
++void            set_aging(int);
++extern volatile uint cpu_online_mask;
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+diff --git a/kernel/main.c b/kernel/main.c
+index df58e32..8c34735 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -30,6 +30,7 @@ main()
+     virtio_disk_init(); // emulated hard disk
+     userinit();         // first user process
+ 
++    __atomic_fetch_or(&cpu_online_mask, 1U << cpuid(), __ATOMIC_SEQ_CST);
+     __atomic_store_n(&started, 1, __ATOMIC_RELEASE);
+   } else {
+     while (__atomic_load_n(&started, __ATOMIC_ACQUIRE) == 0)
+@@ -39,6 +40,7 @@ main()
+     kvminithart();  // turn on paging
+     trapinithart(); // install kernel trap vector
+     plicinithart(); // ask PLIC for device interrupts
++    __atomic_fetch_or(&cpu_online_mask, 1U << cpuid(), __ATOMIC_SEQ_CST);
+   }
+ 
+   scheduler();
+diff --git a/kernel/param.h b/kernel/param.h
+index 1d69801..dbc79c9 100644
+--- a/kernel/param.h
++++ b/kernel/param.h
+@@ -9,6 +9,12 @@
+ #define MAXOPBLOCKS 10                // max # of blocks any FS op writes
+ #define LOGBLOCKS   (MAXOPBLOCKS * 3) // max data blocks in on-disk log
+ #define NBUF        (MAXOPBLOCKS * 3) // size of disk block cache
+-#define FSSIZE      2000              // size of file system in blocks
++#define FSSIZE      4000              // size of file system in blocks (antes 2000; sobra espacio para los programas nuevos)
+ #define MAXPATH     128               // maximum file path name
+ #define USERSTACK   1                 // user stack pages
++
++// --- Extensión del planificador: prioridad + aging + afinidad de CPU ---
++#define MAXPRIO     9                 // prioridad máxima (mayor número = más prioridad)
++#define DEFPRIO     4                 // prioridad por defecto de todo proceso nuevo
++#define AGING_TICKS 2                 // ticks esperando en RUNNABLE para subir 1 nivel
++#define ALLCPUS     ((1U << NCPU) - 1) // máscara de afinidad con todos los CPUs
+diff --git a/kernel/proc.c b/kernel/proc.c
+index f4c1668..41ca1c8 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -4,12 +4,19 @@
+ #include "riscv.h"
+ #include "spinlock.h"
+ #include "proc.h"
++#include "pstat.h"
+ #include "defs.h"
+ 
+ struct cpu cpus[NCPU];
+ 
+ struct proc proc[NPROC];
+ 
++// Máscara de CPUs que ya arrancaron (bit i = CPU i). La llena main().
++volatile uint cpu_online_mask = 0;
++
++// 1 = el aging está activo (se puede apagar con setaging() para las pruebas).
++static int aging_enabled = 1;
++
+ struct proc *initproc;
+ 
+ int nextpid = 1;
+@@ -125,6 +132,16 @@ found:
+   p->pid = allocpid();
+   p->state = USED;
+ 
++  // Valores iniciales del planificador (prioridad, afinidad, estadísticas).
++  p->priority = DEFPRIO;
++  p->eff_priority = DEFPRIO;
++  p->wait_ticks = 0;
++  p->affinity = ALLCPUS;
++  p->last_cpu = -1;
++  p->migrations = 0;
++  for (int i = 0; i < NCPU; i++)
++    p->ticks_cpu[i] = 0;
++
+   // Allocate a trapframe page.
+   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
+     freeproc(p);
+@@ -275,6 +292,13 @@ kfork(void)
+   }
+   np->sz = p->sz;
+ 
++  // Como en Linux, el hijo hereda la prioridad base y la afinidad del padre.
++  // Son enteros alineados: leerlos sin el lock del padre es seguro; si otro
++  // proceso los cambia justo ahora, el hijo toma el valor viejo o el nuevo.
++  np->priority = p->priority;
++  np->eff_priority = p->priority;
++  np->affinity = p->affinity;
++
+   // copy saved user registers.
+   *(np->trapframe) = *(p->trapframe);
+ 
+@@ -425,11 +449,25 @@ kwait(uint64 addr)
+ //  - swtch to start running that process.
+ //  - eventually that process transfers control
+ //    via swtch back to the scheduler.
++//
++// Política: prioridad efectiva (mayor primero) respetando la afinidad.
++// Entre procesos con la misma prioridad se rota (round-robin) empezando
++// después del último proceso que eligió este CPU.
++//
++// IMPORTANTE (evita deadlock): el scheduler NUNCA retiene el lock de un
++// proceso mientras pide el de otro. Primero elige candidato mirando cada
++// proceso con su lock tomado y soltado enseguida; después toma solo el lock
++// del elegido y revalida que siga RUNNABLE, por si otro CPU se lo llevó.
++// Si un CPU retuviera el lock del "mejor" mientras recorre la tabla, y cada
++// CPU la recorre empezando en un punto distinto, dos CPUs podrían pedirse
++// los locks en orden contrario y esperarse para siempre.
+ void
+ scheduler(void)
+ {
+-  struct proc *p;
++  struct proc *p, *best;
+   struct cpu *c = mycpu();
++  int id = cpuid();         // este scheduler siempre corre en el mismo CPU
++  int last = NPROC - 1;     // índice del último proceso que eligió este CPU
+ 
+   c->proc = 0;
+   for (;;) {
+@@ -441,32 +479,202 @@ scheduler(void)
+     intr_on();
+     intr_off();
+ 
+-    int found = 0;
+-    for (p = proc; p < &proc[NPROC]; p++) {
++    // Pasada 1: elegir el RUNNABLE de mayor prioridad efectiva permitido en
++    // este CPU. Un solo lock tomado a la vez.
++    best = 0;
++    int bestprio = -1;
++    for (int k = 1; k <= NPROC; k++) {
++      p = &proc[(last + k) % NPROC];
+       acquire(&p->lock);
+-      if (p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+-        swtch(&c->context, &p->context);
+-
+-        // Don't re-enable interrupts on release.
+-        mycpu()->intena = 0;
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
+-        found = 1;
++      if (p->state == RUNNABLE && (p->affinity & (1U << id)) &&
++          p->eff_priority > bestprio) {
++        best = p;
++        bestprio = p->eff_priority;
+       }
+       release(&p->lock);
+     }
+-    if (found == 0) {
++
++    if (best == 0) {
+       // nothing to run; stop running on this core until an interrupt.
+       asm volatile("wfi");
++      continue;
++    }
++
++    // Pasada 2: tomar solo el lock del elegido y revalidar.
++    acquire(&best->lock);
++    if (best->state == RUNNABLE && (best->affinity & (1U << id))) {
++      // Estadística de migración: corrió antes en otro CPU.
++      if (best->last_cpu != -1 && best->last_cpu != id)
++        best->migrations++;
++      best->last_cpu = id;
++
++      // Al obtener el CPU vuelve a su prioridad base y reinicia la espera.
++      best->eff_priority = best->priority;
++      best->wait_ticks = 0;
++
++      // Switch to chosen process.  It is the process's job
++      // to release its lock and then reacquire it
++      // before jumping back to us.
++      best->state = RUNNING;
++      c->proc = best;
++      swtch(&c->context, &best->context);
++
++      // Don't re-enable interrupts on release.
++      mycpu()->intena = 0;
++
++      // Process is done running for now.
++      // It should have changed its p->state before coming back.
++      c->proc = 0;
++      last = best - proc;
++    }
++    release(&best->lock);
++  }
++}
++
++// Aging: llamada en cada tick de reloj (CPU 0). Todo proceso que lleva
++// AGING_TICKS ticks esperando en RUNNABLE sube un nivel de prioridad efectiva
++// (hasta MAXPRIO). Así un proceso de baja prioridad no sufre inanición.
++void
++aging_tick(void)
++{
++  struct proc *p;
++
++  if (!__atomic_load_n(&aging_enabled, __ATOMIC_RELAXED))
++    return;
++  for (p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if (p->state == RUNNABLE) {
++      p->wait_ticks++;
++      if (p->wait_ticks >= AGING_TICKS) {
++        p->wait_ticks = 0;
++        if (p->eff_priority < MAXPRIO)
++          p->eff_priority++;
++      }
+     }
++    release(&p->lock);
++  }
++}
++
++// Activa (1) o desactiva (0) el aging. Devuelve el valor anterior.
++void
++set_aging(int on)
++{
++  __atomic_store_n(&aging_enabled, on ? 1 : 0, __ATOMIC_RELAXED);
++}
++
++// Estadística: el proceso que está corriendo consumió un tick de reloj en
++// este CPU. Se llama desde el manejador de la interrupción de reloj.
++void
++account_tick(void)
++{
++  struct proc *p = myproc();
++
++  if (p == 0)
++    return;
++  acquire(&p->lock); // desactiva interrupciones: cpuid() es seguro
++  p->ticks_cpu[cpuid()]++;
++  release(&p->lock);
++}
++
++// Cambia la prioridad base de un proceso (pid 0 = el que llama).
++// Devuelve 0 si tuvo éxito, -1 si la prioridad o el pid no son válidos.
++int
++kpriority(int pid, int prio)
++{
++  struct proc *p;
++
++  if (prio < 0 || prio > MAXPRIO)
++    return -1;
++  if (pid == 0)
++    pid = myproc()->pid;
++  for (p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if (p->state != UNUSED && p->pid == pid) {
++      p->priority = prio;
++      p->eff_priority = prio;
++      p->wait_ticks = 0;
++      release(&p->lock);
++      return 0;
++    }
++    release(&p->lock);
++  }
++  return -1;
++}
++
++// Fija la máscara de afinidad de un proceso (pid 0 = el que llama).
++// La máscara debe incluir al menos un CPU encendido. Devuelve 0 o -1.
++// Si el proceso es el que llama y su CPU actual ya no está permitido,
++// cede el CPU para migrar de inmediato; si es otro proceso, migra en su
++// siguiente tick (cuando vuelva a pasar por el scheduler).
++int
++kaffinity(int pid, uint mask)
++{
++  struct proc *p;
++  struct proc *me = myproc();
++  int self = 0, found = 0;
++
++  mask &= ALLCPUS;
++  if ((mask & __atomic_load_n(&cpu_online_mask, __ATOMIC_SEQ_CST)) == 0)
++    return -1;
++  if (pid == 0)
++    pid = me->pid;
++  for (p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if (p->state != UNUSED && p->pid == pid) {
++      p->affinity = mask;
++      found = 1;
++      self = (p == me);
++      release(&p->lock);
++      break;
++    }
++    release(&p->lock);
++  }
++  if (!found)
++    return -1;
++
++  if (self) {
++    push_off();
++    int id = cpuid();
++    pop_off();
++    if (!(mask & (1U << id)))
++      yield();
++  }
++  return 0;
++}
++
++// Copia a la dirección de usuario addr hasta max estructuras pstat, una por
++// cada proceso en uso. Devuelve cuántas copió, o -1 si addr no es válida.
++int
++kgetptable(uint64 addr, int max)
++{
++  struct proc *p;
++  struct pstat ps;
++  int n = 0;
++
++  for (p = proc; p < &proc[NPROC] && n < max; p++) {
++    acquire(&p->lock);
++    if (p->state == UNUSED) {
++      release(&p->lock);
++      continue;
++    }
++    ps.pid = p->pid;
++    ps.state = p->state;
++    ps.priority = p->priority;
++    ps.eff_priority = p->eff_priority;
++    ps.affinity = p->affinity;
++    ps.last_cpu = p->last_cpu;
++    ps.migrations = p->migrations;
++    ps.online = __atomic_load_n(&cpu_online_mask, __ATOMIC_SEQ_CST);
++    for (int i = 0; i < NCPU; i++)
++      ps.ticks_cpu[i] = p->ticks_cpu[i];
++    safestrcpy(ps.name, p->name, sizeof(ps.name));
++    release(&p->lock);
++
++    if (either_copyout(1, addr + n * sizeof(ps), &ps, sizeof(ps)) < 0)
++      return -1;
++    n++;
+   }
++  return n;
+ }
+ 
+ // Switch to scheduler.  Must hold only p->lock
+@@ -695,7 +903,8 @@ procdump(void)
+       state = states[p->state];
+     else
+       state = "???";
+-    printk("%d %s %s", p->pid, state, p->name);
++    printk("%d %s %s prio=%d/%d aff=0x%x cpu=%d", p->pid, state, p->name,
++           p->priority, p->eff_priority, p->affinity, p->last_cpu);
+     printk("\n");
+   }
+ }
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 5603697..788a358 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -89,6 +89,15 @@ struct proc {
+   int xstate;           // Exit status to be returned to parent's wait
+   int pid;              // Process ID
+ 
++  // --- Extensión: planificador con prioridad, aging y afinidad (p->lock) ---
++  int priority;         // Prioridad base (0..MAXPRIO, mayor = más prioritario)
++  int eff_priority;     // Prioridad efectiva (sube por aging mientras espera)
++  int wait_ticks;       // Ticks consecutivos esperando en RUNNABLE
++  uint affinity;        // Máscara de CPUs permitidos (bit i = CPU i)
++  int last_cpu;         // Último CPU donde corrió (-1 = nunca)
++  int migrations;       // Veces que cambió de CPU entre dos ejecuciones
++  uint ticks_cpu[NCPU]; // Ticks de reloj que pasó corriendo en cada CPU
++
+   // wait_lock must be held when using this:
+   struct proc *parent; // Parent process
+ 
+diff --git a/kernel/pstat.h b/kernel/pstat.h
+new file mode 100644
+index 0000000..3b89a90
+--- /dev/null
++++ b/kernel/pstat.h
+@@ -0,0 +1,15 @@
++// Información de planificación de un proceso, devuelta por getptable().
++// Se comparte entre el kernel y los programas de usuario (taskset, cpustat...).
++// Requiere haber incluido types.h y param.h antes.
++struct pstat {
++  int pid;
++  int state;            // 0=UNUSED 1=USED 2=SLEEPING 3=RUNNABLE 4=RUNNING 5=ZOMBIE
++  int priority;         // prioridad base
++  int eff_priority;     // prioridad efectiva (con aging)
++  uint affinity;        // máscara de CPUs permitidos
++  int last_cpu;         // último CPU donde corrió (-1 = nunca)
++  int migrations;       // cambios de CPU entre ejecuciones consecutivas
++  uint online;          // máscara de CPUs encendidos en el sistema
++  uint ticks_cpu[NCPU]; // ticks de reloj corridos en cada CPU
++  char name[16];
++};
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1800f20..d7cf3c2 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -103,6 +103,11 @@ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+ extern uint64 sys_sync(void);
++extern uint64 sys_setpriority(void);
++extern uint64 sys_setaffinity(void);
++extern uint64 sys_getptable(void);
++extern uint64 sys_getcpu(void);
++extern uint64 sys_setaging(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -130,6 +135,11 @@ static uint64 (*syscalls[])(void) = {
+   [SYS_mkdir]   = sys_mkdir,
+   [SYS_close]   = sys_close,
+   [SYS_sync]    = sys_sync,
++  [SYS_setpriority] = sys_setpriority,
++  [SYS_setaffinity] = sys_setaffinity,
++  [SYS_getptable]   = sys_getptable,
++  [SYS_getcpu]      = sys_getcpu,
++  [SYS_setaging]    = sys_setaging,
+   // clang-format on
+ };
+ 
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 5a4a39f..dc33ced 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -21,3 +21,8 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_sync   22
++#define SYS_setpriority 23
++#define SYS_setaffinity 24
++#define SYS_getptable   25
++#define SYS_getcpu      26
++#define SYS_setaging    27
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index cd25557..addff8a 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -110,3 +110,65 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++// ---- Extensión del planificador: prioridad, afinidad de CPU y estadísticas ----
++
++// setpriority(pid, prio): fija la prioridad base (0..MAXPRIO). pid 0 = yo.
++uint64
++sys_setpriority(void)
++{
++  int pid, prio;
++
++  argint(0, &pid);
++  argint(1, &prio);
++  return kpriority(pid, prio);
++}
++
++// setaffinity(pid, mask): fija la máscara de CPUs permitidos. pid 0 = yo.
++uint64
++sys_setaffinity(void)
++{
++  int pid, mask;
++
++  argint(0, &pid);
++  argint(1, &mask);
++  return kaffinity(pid, (uint)mask);
++}
++
++// getptable(arr, max): copia la información de planificación de los procesos
++// en uso. Devuelve cuántos copió.
++uint64
++sys_getptable(void)
++{
++  uint64 addr;
++  int max;
++
++  argaddr(0, &addr);
++  argint(1, &max);
++  if (max < 0)
++    return -1;
++  return kgetptable(addr, max);
++}
++
++// getcpu(): número del CPU donde se está ejecutando el proceso (como sched_getcpu).
++uint64
++sys_getcpu(void)
++{
++  int id;
++
++  push_off(); // sin interrupciones, el proceso no puede cambiar de CPU a mitad
++  id = cpuid();
++  pop_off();
++  return id;
++}
++
++// setaging(on): activa (1) o desactiva (0) el aging del planificador.
++uint64
++sys_setaging(void)
++{
++  int on;
++
++  argint(0, &on);
++  set_aging(on);
++  return 0;
++}
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 00e99bc..52c8f28 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -82,8 +82,10 @@ usertrap(void)
+     kexit(-1);
+ 
+   // give up the CPU if this is a timer interrupt.
+-  if (which_dev == 2)
++  if (which_dev == 2) {
++    account_tick(); // estadística: 1 tick más en este CPU
+     yield();
++  }
+ 
+   prepare_return();
+ 
+@@ -154,8 +156,10 @@ kerneltrap()
+   }
+ 
+   // give up the CPU if this is a timer interrupt.
+-  if (which_dev == 2 && myproc() != 0)
++  if (which_dev == 2 && myproc() != 0) {
++    account_tick(); // estadística: 1 tick más en este CPU
+     yield();
++  }
+ 
+   // the yield() may have caused some traps to occur,
+   // so restore trap registers for use by kernelvec.S's sepc instruction.
+@@ -171,6 +175,7 @@ clockintr()
+     ticks++;
+     wakeup(&ticks);
+     release(&tickslock);
++    aging_tick(); // envejece a los procesos que esperan CPU
+   }
+ 
+   // ask for the next timer interrupt. this also clears
+diff --git a/user/cpustat.c b/user/cpustat.c
+new file mode 100644
+index 0000000..c3f8aaf
+--- /dev/null
++++ b/user/cpustat.c
+@@ -0,0 +1,97 @@
++// cpustat [pid]: tabla de planificación de los procesos: estado, prioridad base
++// y efectiva, afinidad, último CPU, migraciones y ticks consumidos en cada CPU.
++#include "kernel/types.h"
++#include "kernel/param.h"
++#include "kernel/pstat.h"
++#include "user/user.h"
++
++static struct pstat tab[NPROC];
++static char *states[] = {"unused", "used", "sleep", "runble", "run", "zombie"};
++
++static int
++digits(int v)
++{
++  int d = 1;
++
++  if (v < 0) {
++    d++;
++    v = -v;
++  }
++  while (v >= 10) {
++    d++;
++    v /= 10;
++  }
++  return d;
++}
++
++// Imprime un entero alineado a la derecha en un campo de ancho w.
++static void
++num(int v, int w)
++{
++  int i;
++
++  for (i = digits(v); i < w; i++)
++    printf(" ");
++  printf("%d", v);
++}
++
++// Imprime un texto alineado a la izquierda en un campo de ancho w.
++static void
++str(char *s, int w)
++{
++  int i;
++
++  printf("%s", s);
++  for (i = strlen(s); i < w; i++)
++    printf(" ");
++}
++
++int
++main(int argc, char **argv)
++{
++  int n, i, c, only = -1;
++  uint online;
++
++  if (argc == 2)
++    only = atoi(argv[1]);
++  n = getptable(tab, NPROC);
++  if (n <= 0) {
++    fprintf(2, "cpustat: getptable fallo\n");
++    exit(1);
++  }
++  online = tab[0].online;
++
++  printf("PID NOMBRE     ESTADO PRIO EFEC AFIN  ULT MIGR |");
++  for (c = 0; c < NCPU; c++)
++    if (online & (1U << c))
++      printf(" CPU%d", c);
++  printf("   (ticks de reloj corridos en cada CPU)\n");
++
++  for (i = 0; i < n; i++) {
++    if (only >= 0 && tab[i].pid != only)
++      continue;
++    num(tab[i].pid, 3);
++    printf(" ");
++    str(tab[i].name, 10);
++    printf(" ");
++    str(states[tab[i].state], 6);
++    printf(" ");
++    num(tab[i].priority, 4);
++    printf(" ");
++    num(tab[i].eff_priority, 4);
++    printf(" ");
++    printf("0x%x", tab[i].affinity & online);
++    printf(" ");
++    num(tab[i].last_cpu, 3);
++    printf(" ");
++    num(tab[i].migrations, 4);
++    printf(" |");
++    for (c = 0; c < NCPU; c++)
++      if (online & (1U << c)) {
++        printf(" ");
++        num(tab[i].ticks_cpu[c], 4);
++      }
++    printf("\n");
++  }
++  exit(0);
++}
+diff --git a/user/hog.c b/user/hog.c
+new file mode 100644
+index 0000000..2ad64aa
+--- /dev/null
++++ b/user/hog.c
+@@ -0,0 +1,42 @@
++// hog <ticks>: consume CPU durante <ticks> ticks de reloj y, al terminar,
++// muestra en qué CPUs corrió. Sirve para generar carga en las demostraciones:
++//   taskset -c 0 hog 30 &     (fijo al CPU 0)
++//   hog 30 &                   (sin afinidad: el planificador decide)
++#include "kernel/types.h"
++#include "kernel/param.h"
++#include "kernel/pstat.h"
++#include "user/user.h"
++
++static struct pstat tab[NPROC];
++static volatile uint64 sink;
++
++int
++main(int argc, char **argv)
++{
++  int t, start, n, i, c, me;
++
++  if (argc != 2) {
++    fprintf(2, "uso: hog <ticks>\n");
++    exit(1);
++  }
++  t = atoi(argv[1]);
++  start = uptime();
++  while (uptime() - start < t)
++    for (i = 0; i < 2000; i++)
++      sink += i;
++
++  me = getpid();
++  n = getptable(tab, NPROC);
++  for (i = 0; i < n; i++) {
++    if (tab[i].pid != me)
++      continue;
++    printf("hog %d: prio=%d aff=0x%x migraciones=%d ticks por CPU:", me,
++           tab[i].priority, tab[i].affinity & tab[i].online,
++           tab[i].migrations);
++    for (c = 0; c < NCPU; c++)
++      if (tab[i].online & (1U << c))
++        printf(" CPU%d=%d", c, tab[i].ticks_cpu[c]);
++    printf("\n");
++  }
++  exit(0);
++}
+diff --git a/user/schedtest.c b/user/schedtest.c
+new file mode 100644
+index 0000000..163aa04
+--- /dev/null
++++ b/user/schedtest.c
+@@ -0,0 +1,458 @@
++// schedtest [n]: batería de pruebas del planificador (prioridad + aging + afinidad).
++//   schedtest      ejecuta las 8 pruebas
++//   schedtest 6    ejecuta solo la prueba 6
++// Requiere xv6 con 4 o más CPUs:  make qemu CPUS=4
++// Cada prueba imprime: entrada, resultado esperado, resultado obtenido y PASS/FAIL.
++#include "kernel/types.h"
++#include "kernel/param.h"
++#include "kernel/pstat.h"
++#include "user/user.h"
++
++static struct pstat tab[NPROC];
++static uint online;     // máscara de CPUs encendidos
++static int total, passed;
++static volatile uint64 sink;
++
++// ---------------------------------------------------------------- utilidades
++
++// Trabajo de CPU puro (sin llamadas al sistema).
++static void
++spin(int n)
++{
++  int i;
++
++  for (i = 0; i < n; i++)
++    sink += i;
++}
++
++// Copia en *out la información de planificación del proceso pid.
++static int
++statof(int pid, struct pstat *out)
++{
++  int n = getptable(tab, NPROC), i;
++
++  for (i = 0; i < n; i++) {
++    if (tab[i].pid == pid) {
++      *out = tab[i];
++      return 0;
++    }
++  }
++  return -1;
++}
++
++// Lee exactamente n bytes de un pipe (o menos si todos los escritores cerraron).
++static void
++readn(int fd, void *buf, int n)
++{
++  char *b = buf;
++  int got = 0, r;
++
++  while (got < n) {
++    r = read(fd, b + got, n - got);
++    if (r <= 0)
++      break;
++    got += r;
++  }
++}
++
++// Durante `ticks` ticks anota en qué CPU se ejecuta el proceso (getcpu).
++static void
++sample(int ticks, int *cnt)
++{
++  int t0 = uptime(), c;
++
++  for (c = 0; c < NCPU; c++)
++    cnt[c] = 0;
++  while (uptime() - t0 < ticks) {
++    spin(2000);
++    cnt[getcpu()]++;
++  }
++}
++
++static void
++head(int n, char *title, char *input, char *expected)
++{
++  printf("\n[T%d] %s\n", n, title);
++  printf("  entrada : %s\n", input);
++  printf("  esperado: %s\n", expected);
++}
++
++static void
++result(int ok)
++{
++  total++;
++  if (ok)
++    passed++;
++  printf("  resultado: %s\n", ok ? "PASS" : "FAIL");
++}
++
++// ------------------------------------------------------------------- pruebas
++
++// T1: un proceso fijado a un solo CPU nunca corre en otro.
++static void
++t1(void)
++{
++  int p[2], cnt[NCPU], c, others = 0;
++
++  head(1, "Afinidad dura a un CPU", "setaffinity(0, CPU1); 15 ticks muestreando getcpu()",
++       "todas las muestras en CPU1");
++  pipe(p);
++  if (fork() == 0) {
++    setaffinity(0, 1U << 1);
++    sample(15, cnt);
++    write(p[1], cnt, sizeof(cnt));
++    exit(0);
++  }
++  close(p[1]);
++  readn(p[0], cnt, sizeof(cnt));
++  close(p[0]);
++  wait(0);
++  for (c = 0; c < NCPU; c++)
++    if (c != 1)
++      others += cnt[c];
++  printf("  obtenido: muestras en CPU1=%d, en otros CPUs=%d\n", cnt[1], others);
++  result(cnt[1] > 0 && others == 0);
++}
++
++// T2: con una máscara de varios CPUs, solo se usan esos CPUs.
++static void
++t2(void)
++{
++  int p[2], cnt[NCPU], tot[NCPU], i, c, outside = 0;
++
++  head(2, "Mascara de varios CPUs", "3 procesos con afinidad {CPU1, CPU2}; 15 ticks cada uno",
++       "muestras solo en CPU1 y CPU2; ninguna en el resto");
++  for (c = 0; c < NCPU; c++)
++    tot[c] = 0;
++  pipe(p);
++  for (i = 0; i < 3; i++) {
++    if (fork() == 0) {
++      setaffinity(0, (1U << 1) | (1U << 2));
++      sample(15, cnt);
++      write(p[1], cnt, sizeof(cnt));
++      exit(0);
++    }
++  }
++  close(p[1]);
++  for (i = 0; i < 3; i++) {
++    readn(p[0], cnt, sizeof(cnt));
++    for (c = 0; c < NCPU; c++)
++      tot[c] += cnt[c];
++  }
++  close(p[0]);
++  for (i = 0; i < 3; i++)
++    wait(0);
++  for (c = 0; c < NCPU; c++)
++    if (c != 1 && c != 2)
++      outside += tot[c];
++  printf("  obtenido: CPU1=%d CPU2=%d, fuera de la mascara=%d\n", tot[1], tot[2], outside);
++  result(tot[1] + tot[2] > 0 && outside == 0);
++}
++
++// T3: argumentos inválidos se rechazan; los válidos se aceptan.
++static void
++t3(void)
++{
++  int r1, r2, r3, r4, r5, r6, r7, off, c, ok;
++
++  head(3, "Validacion de argumentos",
++       "mascara 0, CPU inexistente, pid inexistente, prioridad -1 y 10; luego casos validos",
++       "los 5 invalidos devuelven -1; los 2 validos devuelven 0");
++  r1 = setaffinity(0, 0);
++  off = -1;
++  for (c = 0; c < NCPU; c++)
++    if (!(online & (1U << c)))
++      off = c;
++  r2 = (off >= 0) ? setaffinity(0, 1U << off) : -1; // sin CPUs apagados: no aplica
++  r3 = setaffinity(30000, 1);
++  r4 = setpriority(0, -1);
++  r5 = setpriority(0, MAXPRIO + 1);
++  r6 = setaffinity(0, online);
++  r7 = setpriority(0, DEFPRIO);
++  printf("  obtenido: mascara0=%d cpu_inexistente=%d pid_inexistente=%d prio(-1)=%d prio(%d)=%d | validos: %d %d\n",
++         r1, r2, r3, r4, MAXPRIO + 1, r5, r6, r7);
++  ok = r1 == -1 && r2 == -1 && r3 == -1 && r4 == -1 && r5 == -1 && r6 == 0 && r7 == 0;
++  result(ok);
++}
++
++// T4: el hijo hereda la prioridad y la afinidad del padre (como en Linux).
++static void
++t4(void)
++{
++  int st, bad = 0;
++
++  head(4, "Herencia en fork()", "padre: prioridad 7 y afinidad {CPU2}; luego fork()",
++       "el hijo ve prioridad 7, afinidad 0x4 y se ejecuta en CPU2");
++  setpriority(0, 7);
++  setaffinity(0, 1U << 2);
++  if (fork() == 0) {
++    struct pstat me;
++    int code = 0;
++
++    if (statof(getpid(), &me) < 0)
++      exit(8);
++    if (me.priority != 7)
++      code |= 1;
++    if (me.affinity != (1U << 2))
++      code |= 2;
++    if (getcpu() != 2)
++      code |= 4;
++    exit(code);
++  }
++  wait(&st);
++  setpriority(0, DEFPRIO);
++  setaffinity(0, online);
++  if (st & 1)
++    bad++;
++  if (st & 2)
++    bad++;
++  if (st & 4)
++    bad++;
++  printf("  obtenido: codigo de salida del hijo=%d (bit1=prioridad, bit2=afinidad, bit4=cpu)\n", st);
++  result(st == 0 && bad == 0);
++}
++
++// Calibra cuántas llamadas a spin(1000) caben en un tick (con el sistema en reposo).
++static int
++calibrate(void)
++{
++  int t = uptime(), t0, it = 0;
++
++  while (uptime() == t)
++    ;
++  t0 = uptime();
++  while (uptime() - t0 < 3) {
++    spin(1000);
++    it++;
++  }
++  return it / 3;
++}
++
++// Lanza n procesos que hacen `work` iteraciones de spin(1000); el proceso i
++// queda fijado a masks[i] (0 = sin afinidad). Devuelve los ticks hasta que
++// terminan todos.
++static int
++run_load(int n, uint *masks, int work)
++{
++  int i, k, t0 = uptime();
++
++  for (i = 0; i < n; i++) {
++    if (fork() == 0) {
++      if (masks[i])
++        setaffinity(0, masks[i]);
++      for (k = 0; k < work; k++)
++        spin(1000);
++      exit(0);
++    }
++  }
++  for (i = 0; i < n; i++)
++    wait(0);
++  return uptime() - t0;
++}
++
++// T5: la misma carga tarda ~4 veces mas si todo se concentra en un CPU.
++static void
++t5(void)
++{
++  uint conc[4], rep[4];
++  int i, rate, work, ta, tb;
++
++  head(5, "Carga concentrada vs repartida",
++       "4 procesos CPU-bound iguales: (A) todos fijos al CPU0, (B) uno por CPU",
++       "A tarda al menos el doble que B (en teoria ~4x)");
++  for (i = 0; i < 4; i++) {
++    conc[i] = 1U << 0;
++    rep[i] = 1U << i;
++  }
++  rate = calibrate();
++  work = rate * 20; // ~20 ticks de CPU por proceso
++  ta = run_load(4, conc, work);
++  tb = run_load(4, rep, work);
++  printf("  obtenido: A (concentrada)=%d ticks, B (repartida)=%d ticks\n", ta, tb);
++  result(tb > 0 && ta >= 2 * tb);
++}
++
++// Devuelve el tick (relativo al inicio) en que un proceso de prioridad 0 logra
++// ejecutarse en el CPU0 mientras otro de prioridad MAXPRIO lo ocupa 60 ticks.
++static int
++starve_run(int aging)
++{
++  int ready[2], res[2], d = -1, t0;
++  char b = 'r';
++
++  pipe(ready);
++  pipe(res);
++  setaging(aging);
++  setaffinity(0, 1U << 1); // el padre en CPU1: no compite con los hijos
++  t0 = uptime();
++  if (fork() == 0) { // H: prioridad alta, ocupa el CPU0 hasta t0+60
++    setpriority(0, MAXPRIO);
++    setaffinity(0, 1U << 0);
++    write(ready[1], &b, 1);
++    while (uptime() - t0 < 60)
++      spin(2000);
++    exit(0);
++  }
++  read(ready[0], &b, 1); // H ya esta en el CPU0
++  if (fork() == 0) { // L: prioridad 0; anota cuando consigue ejecutarse en CPU0
++    setpriority(0, 0);
++    setaffinity(0, 1U << 0);
++    d = uptime() - t0;
++    write(res[1], &d, sizeof(d));
++    exit(0);
++  }
++  close(res[1]);
++  readn(res[0], &d, sizeof(d));
++  close(res[0]);
++  close(ready[0]);
++  close(ready[1]);
++  wait(0);
++  wait(0);
++  setaging(1);
++  setaffinity(0, online);
++  return d;
++}
++
++// T6: sin aging un proceso de baja prioridad sufre inanicion; con aging no.
++static void
++t6(void)
++{
++  int off, on;
++
++  head(6, "Aging evita la inanicion",
++       "H(prio 9) ocupa el CPU0 60 ticks; L(prio 0) espera en CPU0. Se mide cuando corre L",
++       "sin aging L corre >= 50 ticks (tras H); con aging L corre antes de 40 ticks");
++  off = starve_run(0);
++  on = starve_run(1);
++  printf("  obtenido: L empieza en el tick %d sin aging y en el tick %d con aging\n", off, on);
++  result(off >= 50 && on < 40 && on < off);
++}
++
++// T7: con afinidad dura no hay migraciones; sin afinidad si.
++static void
++t7(void)
++{
++  int p[2], i, m, mu = 0, mp = 0;
++  struct pstat me;
++
++  head(7, "Migraciones entre CPUs",
++       "6 procesos CPU-bound 25 ticks sobre 4 CPUs: sin afinidad y fijos (i mod 4)",
++       "sin afinidad migraciones > 0; con afinidad dura migraciones = 0 (tras fijar)");
++  for (int pinned = 0; pinned < 2; pinned++) {
++    pipe(p);
++    for (i = 0; i < 6; i++) {
++      if (fork() == 0) {
++        int t0 = uptime(), base = -1;
++
++        // Al fijarse, el proceso puede ceder su CPU actual y reaparecer en la
++        // CPU pedida: esa unica migracion previa no cuenta. Se mide desde aqui.
++        if (pinned)
++          setaffinity(0, 1U << (i % 4));
++        if (statof(getpid(), &me) == 0)
++          base = me.migrations;
++        while (uptime() - t0 < 25)
++          spin(2000);
++        m = (base >= 0 && statof(getpid(), &me) == 0) ? me.migrations - base : -1;
++        write(p[1], &m, sizeof(m));
++        exit(0);
++      }
++    }
++    close(p[1]);
++    for (i = 0; i < 6; i++) {
++      readn(p[0], &m, sizeof(m));
++      if (pinned)
++        mp += m;
++      else
++        mu += m;
++    }
++    close(p[0]);
++    for (i = 0; i < 6; i++)
++      wait(0);
++  }
++  printf("  obtenido: migraciones sin afinidad=%d, con afinidad dura=%d\n", mu, mp);
++  result(mu > 0 && mp == 0);
++}
++
++// T8: estres del planificador con 4 CPUs (el diseño anterior podia congelarse
++// por un deadlock entre locks de procesos). Si el sistema se cuelga, esta prueba
++// no termina.
++static void
++t8(void)
++{
++  uint seed = 12345, mask;
++  int round, i, st, fails = 0, t0 = uptime(), done = 0;
++
++  head(8, "Estres del planificador (sin deadlock)",
++       "3 rondas x 16 procesos con prioridad y afinidad aleatorias, algunos duermen",
++       "los 48 procesos terminan con codigo 0 y el sistema no se congela");
++  for (round = 0; round < 3; round++) {
++    for (i = 0; i < 16; i++) {
++      seed = seed * 1103515245 + 12345;
++      mask = 1 + ((seed >> 16) % 15); // 1..15: algun CPU de 0..3
++      if (fork() == 0) {
++        int t1 = uptime();
++
++        setpriority(0, (seed >> 8) % (MAXPRIO + 1));
++        if (setaffinity(0, mask) < 0)
++          exit(1);
++        if (i % 4 == 0)
++          pause(1); // ejercita sleep/wakeup
++        while (uptime() - t1 < 2)
++          spin(2000);
++        exit(0);
++      }
++    }
++    for (i = 0; i < 16; i++) {
++      wait(&st);
++      done++;
++      if (st != 0)
++        fails++;
++    }
++  }
++  printf("  obtenido: %d procesos terminados, %d con error, %d ticks\n", done, fails,
++         uptime() - t0);
++  result(done == 48 && fails == 0);
++}
++
++int
++main(int argc, char **argv)
++{
++  struct pstat me;
++  int which = 0, c, ncpu = 0;
++
++  if (statof(getpid(), &me) < 0) {
++    fprintf(2, "schedtest: getptable fallo\n");
++    exit(1);
++  }
++  online = me.online;
++  for (c = 0; c < NCPU; c++)
++    if (online & (1U << c))
++      ncpu++;
++  if (ncpu < 4) {
++    fprintf(2, "schedtest: se requieren 4 CPUs o mas (ejecute: make qemu CPUS=4)\n");
++    exit(1);
++  }
++  if (argc > 1)
++    which = atoi(argv[1]);
++
++  printf("== schedtest: CPUs encendidos=%d (mascara 0x%x), AGING_TICKS=%d, MAXPRIO=%d ==\n",
++         ncpu, online, AGING_TICKS, MAXPRIO);
++  if (which == 0 || which == 1)
++    t1();
++  if (which == 0 || which == 2)
++    t2();
++  if (which == 0 || which == 3)
++    t3();
++  if (which == 0 || which == 4)
++    t4();
++  if (which == 0 || which == 5)
++    t5();
++  if (which == 0 || which == 6)
++    t6();
++  if (which == 0 || which == 7)
++    t7();
++  if (which == 0 || which == 8)
++    t8();
++  printf("\n== Resultado: %d/%d pruebas PASS ==\n", passed, total);
++  exit(passed == total ? 0 : 1);
++}
+diff --git a/user/taskset.c b/user/taskset.c
+new file mode 100644
+index 0000000..d384bb3
+--- /dev/null
++++ b/user/taskset.c
+@@ -0,0 +1,102 @@
++// taskset: fija o consulta la afinidad de CPU de un proceso (como taskset de Linux).
++//   taskset -c LISTA comando [args...]   ejecuta comando solo en los CPUs de LISTA
++//   taskset -p PID LISTA                 cambia la afinidad de un proceso existente
++//   taskset -p PID                       muestra la afinidad de un proceso
++// LISTA: "0", "0,2", "1-3", "0,2-3"
++#include "kernel/types.h"
++#include "kernel/param.h"
++#include "kernel/pstat.h"
++#include "user/user.h"
++
++static struct pstat tab[NPROC];
++
++// Convierte "0,2-3" en la máscara 0b1101. Devuelve 0 si la lista es inválida.
++static uint
++parselist(char *s)
++{
++  uint mask = 0;
++  int a, b;
++
++  while (*s) {
++    if (*s < '0' || *s > '9')
++      return 0;
++    a = 0;
++    while (*s >= '0' && *s <= '9') {
++      a = a * 10 + (*s - '0');
++      s++;
++    }
++    b = a;
++    if (*s == '-') {
++      s++;
++      if (*s < '0' || *s > '9')
++        return 0;
++      b = 0;
++      while (*s >= '0' && *s <= '9') {
++        b = b * 10 + (*s - '0');
++        s++;
++      }
++    }
++    if (a > b || b >= NCPU)
++      return 0;
++    for (; a <= b; a++)
++      mask |= 1U << a;
++    if (*s == ',')
++      s++;
++    else if (*s)
++      return 0;
++  }
++  return mask;
++}
++
++static void
++showaffinity(int pid)
++{
++  int n = getptable(tab, NPROC), i;
++
++  for (i = 0; i < n; i++) {
++    if (tab[i].pid == pid) {
++      printf("pid %d (%s): afinidad = 0x%x\n", pid, tab[i].name, tab[i].affinity);
++      return;
++    }
++  }
++  fprintf(2, "taskset: no existe el pid %d\n", pid);
++  exit(1);
++}
++
++int
++main(int argc, char **argv)
++{
++  uint mask;
++
++  if (argc >= 4 && strcmp(argv[1], "-c") == 0) {
++    mask = parselist(argv[2]);
++    if (mask == 0) {
++      fprintf(2, "taskset: lista de CPUs invalida: %s\n", argv[2]);
++      exit(1);
++    }
++    if (setaffinity(0, mask) < 0) {
++      fprintf(2, "taskset: setaffinity fallo (CPU apagado o inexistente)\n");
++      exit(1);
++    }
++    // La afinidad se conserva a través de exec(), igual que en Linux.
++    exec(argv[3], &argv[3]);
++    fprintf(2, "taskset: no pude ejecutar %s\n", argv[3]);
++    exit(1);
++  }
++  if (argc == 3 && strcmp(argv[1], "-p") == 0) {
++    showaffinity(atoi(argv[2]));
++    exit(0);
++  }
++  if (argc == 4 && strcmp(argv[1], "-p") == 0) {
++    mask = parselist(argv[3]);
++    if (mask == 0 || setaffinity(atoi(argv[2]), mask) < 0) {
++      fprintf(2, "taskset: no se pudo cambiar la afinidad\n");
++      exit(1);
++    }
++    showaffinity(atoi(argv[2]));
++    exit(0);
++  }
++  fprintf(2, "uso: taskset -c LISTA comando [args...]\n");
++  fprintf(2, "     taskset -p PID [LISTA]\n");
++  exit(1);
++}
+diff --git a/user/user.h b/user/user.h
+index 29aad59..35b5ab4 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,6 +1,7 @@
+ #define SBRK_ERROR ((char *)-1)
+ 
+ struct stat;
++struct pstat;
+ 
+ // system calls
+ int fork(void);
+@@ -25,6 +26,11 @@ char *sys_sbrk(int, int);
+ int pause(int);
+ int uptime(void);
+ int sync(void);
++int setpriority(int, int);
++int setaffinity(int, uint);
++int getptable(struct pstat *, int);
++int getcpu(void);
++int setaging(int);
+ 
+ // ulib.c
+ int stat(const char *, struct stat *);
+diff --git a/user/usys.pl b/user/usys.pl
+index 4d054e8..a7f7730 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -43,3 +43,8 @@ entry("sbrk");
+ entry("pause");
+ entry("uptime");
+ entry("sync");
++entry("setpriority");
++entry("setaffinity");
++entry("getptable");
++entry("getcpu");
++entry("setaging");
