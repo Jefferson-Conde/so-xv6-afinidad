@@ -24,14 +24,14 @@ El código fuente completo y el `README.md` con las instrucciones de instalació
 
 | Figura del informe | Archivo en `evidencias/` | Qué muestra |
 |---|---|---|
-| Figura 2 | `01-compilacion.png` | Compilación y arranque de xv6 con cuatro CPUs |
-| Figura 3 | `11-github.png`, `11b-commits.png` | Repositorio y lista de commits |
-| Figura 4 | `02-cpustat.png` | Tabla de procesos con `cpustat` |
-| Figura 5 | `03-taskset.png` | Proceso fijado a la CPU 1 con `taskset` |
-| Figura 6 | `04-demo-carga.png` | Carga mixta: dos procesos fijos a la CPU 0 y uno libre |
-| Figuras 7 a 14 | `T1.png` a `T8.png` | Una captura por cada caso de prueba (entrada, esperado, obtenido, PASS) |
-| Figura 15 | `09-resumen.png` | Ejecución completa de la batería: 8/8 pruebas PASS |
-| Figura 16 | `10-error-corregido.png` | Planificador previo frente al planificador nuevo (bloqueo corregido) |
+| Figura 2 | [`01-compilacion.png`](evidencias/01-compilacion.png) | Compilación y arranque de xv6 con cuatro CPUs |
+| Figura 3 | [`11-github.png`](evidencias/11-github.png), [`11b-commits.png`](evidencias/11b-commits.png) | Repositorio y lista de commits |
+| Figura 4 | [`02-cpustat.png`](evidencias/02-cpustat.png) | Tabla de procesos con `cpustat` |
+| Figura 5 | [`03-taskset.png`](evidencias/03-taskset.png) | Proceso fijado a la CPU 1 con `taskset` |
+| Figura 6 | [`04-demo-carga.png`](evidencias/04-demo-carga.png) | Carga mixta: dos procesos fijos a la CPU 0 y uno libre |
+| Figuras 7 a 14 | [`T1`](evidencias/T1.png) · [`T2`](evidencias/T2.png) · [`T3`](evidencias/T3.png) · [`T4`](evidencias/T4.png) · [`T5`](evidencias/T5.png) · [`T6`](evidencias/T6.png) · [`T7`](evidencias/T7.png) · [`T8`](evidencias/T8.png) | Una captura por cada caso de prueba (entrada, esperado, obtenido, PASS) |
+| Figura 15 | [`09-resumen.png`](evidencias/09-resumen.png) | Ejecución completa de la batería: 8/8 pruebas PASS |
+| Figura 16 | [`10-error-corregido.png`](evidencias/10-error-corregido.png) | Planificador previo frente al planificador nuevo (bloqueo corregido) |
 
 ## Errores encontrados y corregidos
 
