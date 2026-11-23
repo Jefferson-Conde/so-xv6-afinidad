@@ -4,11 +4,18 @@
 #include "riscv.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "pstat.h"
 #include "defs.h"
 
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
+
+// Máscara de CPUs que ya arrancaron (bit i = CPU i). La llena main().
+volatile uint cpu_online_mask = 0;
+
+// 1 = el aging está activo (se puede apagar con setaging() para las pruebas).
+static int aging_enabled = 1;
 
 struct proc *initproc;
 
@@ -124,6 +131,16 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+
+  // Valores iniciales del planificador (prioridad, afinidad, estadísticas).
+  p->priority = DEFPRIO;
+  p->eff_priority = DEFPRIO;
+  p->wait_ticks = 0;
+  p->affinity = ALLCPUS;
+  p->last_cpu = -1;
+  p->migrations = 0;
+  for (int i = 0; i < NCPU; i++)
+    p->ticks_cpu[i] = 0;
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -275,6 +292,13 @@ kfork(void)
   }
   np->sz = p->sz;
 
+  // Como en Linux, el hijo hereda la prioridad base y la afinidad del padre.
+  // Son enteros alineados: leerlos sin el lock del padre es seguro; si otro
+  // proceso los cambia justo ahora, el hijo toma el valor viejo o el nuevo.
+  np->priority = p->priority;
+  np->eff_priority = p->priority;
+  np->affinity = p->affinity;
+
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
 
@@ -425,11 +449,25 @@ kwait(uint64 addr)
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
+//
+// Política: prioridad efectiva (mayor primero) respetando la afinidad.
+// Entre procesos con la misma prioridad se rota (round-robin) empezando
+// después del último proceso que eligió este CPU.
+//
+// IMPORTANTE (evita deadlock): el scheduler NUNCA retiene el lock de un
+// proceso mientras pide el de otro. Primero elige candidato mirando cada
+// proceso con su lock tomado y soltado enseguida; después toma solo el lock
+// del elegido y revalida que siga RUNNABLE, por si otro CPU se lo llevó.
+// Si un CPU retuviera el lock del "mejor" mientras recorre la tabla, y cada
+// CPU la recorre empezando en un punto distinto, dos CPUs podrían pedirse
+// los locks en orden contrario y esperarse para siempre.
 void
 scheduler(void)
 {
-  struct proc *p;
+  struct proc *p, *best;
   struct cpu *c = mycpu();
+  int id = cpuid();         // este scheduler siempre corre en el mismo CPU
+  int last = NPROC - 1;     // índice del último proceso que eligió este CPU
 
   c->proc = 0;
   for (;;) {
@@ -441,32 +479,202 @@ scheduler(void)
     intr_on();
     intr_off();
 
-    int found = 0;
-    for (p = proc; p < &proc[NPROC]; p++) {
+    // Pasada 1: elegir el RUNNABLE de mayor prioridad efectiva permitido en
+    // este CPU. Un solo lock tomado a la vez.
+    best = 0;
+    int bestprio = -1;
+    for (int k = 1; k <= NPROC; k++) {
+      p = &proc[(last + k) % NPROC];
       acquire(&p->lock);
-      if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Don't re-enable interrupts on release.
-        mycpu()->intena = 0;
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+      if (p->state == RUNNABLE && (p->affinity & (1U << id)) &&
+          p->eff_priority > bestprio) {
+        best = p;
+        bestprio = p->eff_priority;
       }
       release(&p->lock);
     }
-    if (found == 0) {
+
+    if (best == 0) {
       // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
+      continue;
     }
+
+    // Pasada 2: tomar solo el lock del elegido y revalidar.
+    acquire(&best->lock);
+    if (best->state == RUNNABLE && (best->affinity & (1U << id))) {
+      // Estadística de migración: corrió antes en otro CPU.
+      if (best->last_cpu != -1 && best->last_cpu != id)
+        best->migrations++;
+      best->last_cpu = id;
+
+      // Al obtener el CPU vuelve a su prioridad base y reinicia la espera.
+      best->eff_priority = best->priority;
+      best->wait_ticks = 0;
+
+      // Switch to chosen process.  It is the process's job
+      // to release its lock and then reacquire it
+      // before jumping back to us.
+      best->state = RUNNING;
+      c->proc = best;
+      swtch(&c->context, &best->context);
+
+      // Don't re-enable interrupts on release.
+      mycpu()->intena = 0;
+
+      // Process is done running for now.
+      // It should have changed its p->state before coming back.
+      c->proc = 0;
+      last = best - proc;
+    }
+    release(&best->lock);
   }
+}
+
+// Aging: llamada en cada tick de reloj (CPU 0). Todo proceso que lleva
+// AGING_TICKS ticks esperando en RUNNABLE sube un nivel de prioridad efectiva
+// (hasta MAXPRIO). Así un proceso de baja prioridad no sufre inanición.
+void
+aging_tick(void)
+{
+  struct proc *p;
+
+  if (!__atomic_load_n(&aging_enabled, __ATOMIC_RELAXED))
+    return;
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state == RUNNABLE) {
+      p->wait_ticks++;
+      if (p->wait_ticks >= AGING_TICKS) {
+        p->wait_ticks = 0;
+        if (p->eff_priority < MAXPRIO)
+          p->eff_priority++;
+      }
+    }
+    release(&p->lock);
+  }
+}
+
+// Activa (1) o desactiva (0) el aging. Devuelve el valor anterior.
+void
+set_aging(int on)
+{
+  __atomic_store_n(&aging_enabled, on ? 1 : 0, __ATOMIC_RELAXED);
+}
+
+// Estadística: el proceso que está corriendo consumió un tick de reloj en
+// este CPU. Se llama desde el manejador de la interrupción de reloj.
+void
+account_tick(void)
+{
+  struct proc *p = myproc();
+
+  if (p == 0)
+    return;
+  acquire(&p->lock); // desactiva interrupciones: cpuid() es seguro
+  p->ticks_cpu[cpuid()]++;
+  release(&p->lock);
+}
+
+// Cambia la prioridad base de un proceso (pid 0 = el que llama).
+// Devuelve 0 si tuvo éxito, -1 si la prioridad o el pid no son válidos.
+int
+kpriority(int pid, int prio)
+{
+  struct proc *p;
+
+  if (prio < 0 || prio > MAXPRIO)
+    return -1;
+  if (pid == 0)
+    pid = myproc()->pid;
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state != UNUSED && p->pid == pid) {
+      p->priority = prio;
+      p->eff_priority = prio;
+      p->wait_ticks = 0;
+      release(&p->lock);
+      return 0;
+    }
+    release(&p->lock);
+  }
+  return -1;
+}
+
+// Fija la máscara de afinidad de un proceso (pid 0 = el que llama).
+// La máscara debe incluir al menos un CPU encendido. Devuelve 0 o -1.
+// Si el proceso es el que llama y su CPU actual ya no está permitido,
+// cede el CPU para migrar de inmediato; si es otro proceso, migra en su
+// siguiente tick (cuando vuelva a pasar por el scheduler).
+int
+kaffinity(int pid, uint mask)
+{
+  struct proc *p;
+  struct proc *me = myproc();
+  int self = 0, found = 0;
+
+  mask &= ALLCPUS;
+  if ((mask & __atomic_load_n(&cpu_online_mask, __ATOMIC_SEQ_CST)) == 0)
+    return -1;
+  if (pid == 0)
+    pid = me->pid;
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state != UNUSED && p->pid == pid) {
+      p->affinity = mask;
+      found = 1;
+      self = (p == me);
+      release(&p->lock);
+      break;
+    }
+    release(&p->lock);
+  }
+  if (!found)
+    return -1;
+
+  if (self) {
+    push_off();
+    int id = cpuid();
+    pop_off();
+    if (!(mask & (1U << id)))
+      yield();
+  }
+  return 0;
+}
+
+// Copia a la dirección de usuario addr hasta max estructuras pstat, una por
+// cada proceso en uso. Devuelve cuántas copió, o -1 si addr no es válida.
+int
+kgetptable(uint64 addr, int max)
+{
+  struct proc *p;
+  struct pstat ps;
+  int n = 0;
+
+  for (p = proc; p < &proc[NPROC] && n < max; p++) {
+    acquire(&p->lock);
+    if (p->state == UNUSED) {
+      release(&p->lock);
+      continue;
+    }
+    ps.pid = p->pid;
+    ps.state = p->state;
+    ps.priority = p->priority;
+    ps.eff_priority = p->eff_priority;
+    ps.affinity = p->affinity;
+    ps.last_cpu = p->last_cpu;
+    ps.migrations = p->migrations;
+    ps.online = __atomic_load_n(&cpu_online_mask, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < NCPU; i++)
+      ps.ticks_cpu[i] = p->ticks_cpu[i];
+    safestrcpy(ps.name, p->name, sizeof(ps.name));
+    release(&p->lock);
+
+    if (either_copyout(1, addr + n * sizeof(ps), &ps, sizeof(ps)) < 0)
+      return -1;
+    n++;
+  }
+  return n;
 }
 
 // Switch to scheduler.  Must hold only p->lock
@@ -695,7 +903,8 @@ procdump(void)
       state = states[p->state];
     else
       state = "???";
-    printk("%d %s %s", p->pid, state, p->name);
+    printk("%d %s %s prio=%d/%d aff=0x%x cpu=%d", p->pid, state, p->name,
+           p->priority, p->eff_priority, p->affinity, p->last_cpu);
     printk("\n");
   }
 }

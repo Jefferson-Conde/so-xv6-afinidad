@@ -103,6 +103,13 @@ void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
+void            aging_tick(void);
+void            account_tick(void);
+int             kpriority(int, int);
+int             kaffinity(int, uint);
+int             kgetptable(uint64, int);
+void            set_aging(int);
+extern volatile uint cpu_online_mask;
 
 // swtch.S
 void            swtch(struct context*, struct context*);

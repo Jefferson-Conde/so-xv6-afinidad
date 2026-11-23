@@ -89,6 +89,15 @@ struct proc {
   int xstate;           // Exit status to be returned to parent's wait
   int pid;              // Process ID
 
+  // --- Extensión: planificador con prioridad, aging y afinidad (p->lock) ---
+  int priority;         // Prioridad base (0..MAXPRIO, mayor = más prioritario)
+  int eff_priority;     // Prioridad efectiva (sube por aging mientras espera)
+  int wait_ticks;       // Ticks consecutivos esperando en RUNNABLE
+  uint affinity;        // Máscara de CPUs permitidos (bit i = CPU i)
+  int last_cpu;         // Último CPU donde corrió (-1 = nunca)
+  int migrations;       // Veces que cambió de CPU entre dos ejecuciones
+  uint ticks_cpu[NCPU]; // Ticks de reloj que pasó corriendo en cada CPU
+
   // wait_lock must be held when using this:
   struct proc *parent; // Parent process
 

@@ -82,8 +82,10 @@ usertrap(void)
     kexit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2)
+  if (which_dev == 2) {
+    account_tick(); // estadística: 1 tick más en este CPU
     yield();
+  }
 
   prepare_return();
 
@@ -154,8 +156,10 @@ kerneltrap()
   }
 
   // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2 && myproc() != 0)
+  if (which_dev == 2 && myproc() != 0) {
+    account_tick(); // estadística: 1 tick más en este CPU
     yield();
+  }
 
   // the yield() may have caused some traps to occur,
   // so restore trap registers for use by kernelvec.S's sepc instruction.
@@ -171,6 +175,7 @@ clockintr()
     ticks++;
     wakeup(&ticks);
     release(&tickslock);
+    aging_tick(); // envejece a los procesos que esperan CPU
   }
 
   // ask for the next timer interrupt. this also clears
