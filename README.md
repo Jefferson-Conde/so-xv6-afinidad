@@ -10,7 +10,7 @@ Docente: Ing. Lizbeth Jaico Quispe.
 |---|---|
 | Oré Mischa, Kengy Samir | [KengySamir27](https://github.com/KengySamir27) |
 | Conde Flores, Jefferson | [Jefferson-Conde](https://github.com/Jefferson-Conde)  |
-| Huicho Solier, Frank Felix | _(completar)_ |
+| Huicho Solier, Frank Felix |Frank1807|
 
 ## Descripción
 
