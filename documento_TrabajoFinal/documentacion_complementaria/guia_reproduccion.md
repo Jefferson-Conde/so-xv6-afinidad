@@ -4,20 +4,14 @@ Esta guía permite repetir la compilación, la ejecución y las pruebas del proy
 
 ## 1. Entorno
 
-Ubuntu (el desarrollo se hizo en Ubuntu sobre WSL2). Instalar los paquetes necesarios:
-
-```bash
-sudo apt update
-sudo apt install git build-essential gdb-multiarch qemu-system-misc \
-    gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu
-```
+Instala las [dependencias para tu distribución](../../README.md#requisitos). La guía usa el prefijo `riscv64-linux-gnu-` y cuatro CPU virtuales.
 
 ## 2. Opción A: clonar el repositorio final
 
 ```bash
 git clone https://github.com/KengySamir27/so-xv6-afinidad.git
 cd so-xv6-afinidad
-make qemu CPUS=4
+make qemu CPUS=4 TOOLPREFIX=riscv64-linux-gnu-
 ```
 
 Resultado esperado: el kernel arranca, aparecen `hart 1 starting`, `hart 2 starting` y `hart 3 starting`, y luego el prompt `$`.
@@ -31,18 +25,20 @@ Cada paso compila por sí solo.
 ```bash
 git clone https://github.com/mit-pdos/xv6-riscv.git xv6-limpio
 cd xv6-limpio
-git checkout 9e3161a
-git checkout -b proyecto-final
+git switch -c proyecto-final 9e3161a
 git apply RUTA/paso1-planificador.patch
 git apply RUTA/paso2-syscalls.patch
 git apply RUTA/paso3-herramientas.patch
 git apply RUTA/paso4-pruebas.patch
-make qemu CPUS=4
+git add -N -- Makefile kernel user
+git diff --stat 9e3161a -- Makefile kernel user
+make qemu CPUS=4 TOOLPREFIX=riscv64-linux-gnu-
 ```
 
-`RUTA` es la carpeta `documento_TrabajoFinal/documentacion_complementaria/parches/` del repositorio. El resultado debe ser
-idéntico al del repositorio final: 17 archivos distintos del commit base, con 1067 líneas añadidas y 23 eliminadas
-(se puede comprobar con `git diff --stat 9e3161a`). `todo-junto.patch` contiene los cuatro pasos en un solo parche.
+Sustituye `RUTA` por la ruta absoluta de `documento_TrabajoFinal/documentacion_complementaria/parches/` en tu copia del repositorio del equipo. El resultado debe coincidir con el código del repositorio final: 17 archivos distintos del commit base, con 1067 líneas añadidas y 23 eliminadas.
+
+El bloque anterior marca los archivos nuevos con `git add -N` para que se incluyan en la comparación.
+Como alternativa a aplicar los cuatro archivos por separado, `todo-junto.patch` contiene la secuencia completa.
 
 | Parche | Contenido |
 |---|---|
@@ -86,7 +82,7 @@ y el proceso libre reparte sus ticks entre las otras CPUs y acumula muchas migra
 
 ## 6. Problemas frecuentes
 
-- **QEMU no arranca o falta el compilador:** confirmar que los paquetes `qemu-system-misc` y `gcc-riscv64-linux-gnu` están instalados.
+- **QEMU no arranca o falta el compilador:** comprobar que `qemu-system-riscv64 --version` y `riscv64-linux-gnu-gcc --version` funcionan en el anfitrión.
 - **T5 no muestra mejora:** esa prueba supone que QEMU ejecuta las CPUs en paralelo (un hilo del anfitrión por CPU).
   Si el equipo tiene un solo núcleo disponible, la mejora no se verá.
 - **`git push` en WSL falla con `git-credential-manager.exe: not found`:** la ruta del asistente de credenciales de Windows no
