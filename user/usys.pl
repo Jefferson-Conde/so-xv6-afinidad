@@ -43,3 +43,8 @@ entry("sbrk");
 entry("pause");
 entry("uptime");
 entry("sync");
+entry("setpriority");
+entry("setaffinity");
+entry("getptable");
+entry("getcpu");
+entry("setaging");

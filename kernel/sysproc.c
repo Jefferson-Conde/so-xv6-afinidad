@@ -110,3 +110,65 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+// ---- Extensión del planificador: prioridad, afinidad de CPU y estadísticas ----
+
+// setpriority(pid, prio): fija la prioridad base (0..MAXPRIO). pid 0 = yo.
+uint64
+sys_setpriority(void)
+{
+  int pid, prio;
+
+  argint(0, &pid);
+  argint(1, &prio);
+  return kpriority(pid, prio);
+}
+
+// setaffinity(pid, mask): fija la máscara de CPUs permitidos. pid 0 = yo.
+uint64
+sys_setaffinity(void)
+{
+  int pid, mask;
+
+  argint(0, &pid);
+  argint(1, &mask);
+  return kaffinity(pid, (uint)mask);
+}
+
+// getptable(arr, max): copia la información de planificación de los procesos
+// en uso. Devuelve cuántos copió.
+uint64
+sys_getptable(void)
+{
+  uint64 addr;
+  int max;
+
+  argaddr(0, &addr);
+  argint(1, &max);
+  if (max < 0)
+    return -1;
+  return kgetptable(addr, max);
+}
+
+// getcpu(): número del CPU donde se está ejecutando el proceso (como sched_getcpu).
+uint64
+sys_getcpu(void)
+{
+  int id;
+
+  push_off(); // sin interrupciones, el proceso no puede cambiar de CPU a mitad
+  id = cpuid();
+  pop_off();
+  return id;
+}
+
+// setaging(on): activa (1) o desactiva (0) el aging del planificador.
+uint64
+sys_setaging(void)
+{
+  int on;
+
+  argint(0, &on);
+  set_aging(on);
+  return 0;
+}
